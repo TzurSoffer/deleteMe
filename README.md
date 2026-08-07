@@ -52,7 +52,7 @@ python main.py
 - [main.py](main.py) contains the Tkinter GUI and camera flow.
 - [deleteMe.py](deleteMe.py) contains the main effect logic.
 - [utils.py](utils.py) contains the person and hand helpers.
-- [bg.jpg](bg.jpg) is the saved background image created by the app.
+- `bg.jpg` is the saved background image created by the app at runtime.
 
 ## Notes
 
