@@ -2,6 +2,9 @@
 
 DeleteMe is a small OpenCV-based webcam app that removes a person from the frame when they close their fist
 
+## Showcase:
+[![Preview Image](https://img.youtube.com/vi/-lTpwSLZpeo/maxresdefault.jpg)](https://www.youtube.com/shorts/-lTpwSLZpeo)
+
 ## Requirements
 
 - Python 3.10+ recommended
