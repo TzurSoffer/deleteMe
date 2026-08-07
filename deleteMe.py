@@ -26,8 +26,6 @@ class DeleteMe():
         bbox = self.personDetector.detectBbox(frame)
         if bbox == None:        #< person not found
             return frame
-        frame = self.personDetector.drawBox(frame, bbox)
-
         x, y, w, h = bbox
         frame[y:y+h, x:x+w] = self.bgImage[y:y+h, x:x+w]
         return frame
