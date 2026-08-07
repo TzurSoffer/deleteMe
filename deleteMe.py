@@ -7,7 +7,7 @@ class DeleteMe():
         self.handStateClassifier = HandStateClassifier()
         self.bgImage = None
         self.state = KeepState(registerFor, fps, initialState=False)
-        if bgImage != None:
+        if bgImage is not None:
             self.loadBackgroundImage(bgImage)
 
     def loadBackgroundImage(self, bgImage):
