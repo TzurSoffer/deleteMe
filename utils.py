@@ -7,8 +7,8 @@ from mediapipe.tasks.python import vision
 
 class KeepState:
     def __init__(self, keepfor, fps=1, initialState=False):
-        self.i = 0
         self.keepfor = int(keepfor*fps)
+        self.i = self.keepfor  #< start saturated so the first flip debounces like the rest
         self.state = initialState
 
     def update(self, state):
