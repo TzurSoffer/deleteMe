@@ -1,2 +1,11 @@
-opencv-python
-mediapipe<
+# Runtime dependencies.
+#
+# Ranges rather than exact pins: this is an application people clone and run,
+# and exact pins rot within months. CI resolves and records a lockfile.
+#
+# opencv-contrib-python (not opencv-python) is deliberate: mediapipe already
+# depends on it, and the three OpenCV distributions install into the same
+# `cv2` namespace and clobber each other when more than one is present.
+mediapipe>=1.0,<2
+numpy>=2,<3
+opencv-contrib-python>=4.10,<6

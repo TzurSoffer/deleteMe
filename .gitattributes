@@ -1,0 +1,11 @@
+# Normalise line endings so the repo stays LF-clean across Windows and Linux CI.
+* text=auto eol=lf
+
+# Model assets and media are binary and must never be line-ending converted.
+*.tflite binary
+*.task   binary
+*.jpg    binary
+*.jpeg   binary
+*.png    binary
+*.gif    binary
+*.mp4    binary

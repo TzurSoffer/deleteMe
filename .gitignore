@@ -1,5 +1,32 @@
-.venv
-.history
+# Byte-compiled / build artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.history/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Local captures, recordings and legacy background plates.
+# The background plate now lives in the per-user data directory, not the repo.
 bg.jpg
+recordings/
 *.mp4
 *.mp3
