@@ -73,6 +73,36 @@ def test_lut_saturates_instead_of_wrapping():
     assert np.uint8(np.int32(200 * 2).astype(np.uint8)) == 144  # the trap, documented
 
 
+def test_lut_rounds_rather_than_truncating():
+    """`astype(uint8)` floors, which discards a sub-1.0 bias outright.
+
+    A fitted bias of +0.9 produced a table bit-identical to the identity, even
+    though a bias move of only 0.3 is enough to trigger a rebuild — the code
+    kept sub-level precision in the parameters and then floored it away in the
+    table, leaving a permanent ~1 level floor under the health residual.
+    """
+    lut = build_lut(np.ones(3, np.float32), np.full(3, 0.9, np.float32))
+    identity = build_lut(np.ones(3, np.float32), np.zeros(3, np.float32))
+
+    assert not np.array_equal(lut, identity), "a +0.9 bias was thrown away"
+    assert int(lut[0, 10, 0]) == 11
+
+
+def test_the_correction_is_exact_on_a_clean_relight():
+    """The property this module's own docstring claims: residual 8.0 -> 0.00.
+
+    It was not true of the implementation while the table truncated.
+    """
+    plate = textured_frame(640, 480, seed=9)
+    frame = relight(plate, (1.2, 1.2, 1.2), (-10.0, -10.0, -10.0))
+
+    fit = fit_gain_bias(plate, frame, None)
+    assert fit is not None
+    corrected = apply_lut(plate, build_lut(fit.gain, fit.bias))
+
+    assert float(np.median(cv2.absdiff(corrected, frame))) == 0.0
+
+
 def test_lut_is_applied_per_channel():
     lut = build_lut(np.ones(3, np.float32), np.array([0.0, 50.0, 100.0], np.float32))
     probe = np.full((1, 1, 3), 10, np.uint8)
@@ -155,6 +185,27 @@ def test_tracker_flags_a_correction_that_means_the_scene_changed():
 
     assert tracker.out_of_range
     assert tracker.gain == pytest.approx([1.0, 1.0, 1.0], abs=1e-6), "parameters left alone"
+
+
+def test_the_scene_changed_verdict_does_not_latch():
+    """A refused fit is not evidence that the scene changed.
+
+    Leaving the flag set meant one clipped fit followed by a subject close
+    enough to starve the fit kept reporting "the scene has changed, not just the
+    light". That reason is checked before every other explanation, so it masked
+    whatever was actually wrong.
+    """
+    plate = textured_frame(640, 480, seed=7)
+    tracker = PhotometryTracker()
+
+    tracker.update(plate, np.zeros_like(plate), None, now=0.0)
+    assert tracker.out_of_range
+
+    blind = np.zeros(plate.shape[:2], np.uint8)
+    assert tracker.update(plate, plate, blind, now=0.1) is None
+
+    assert tracker.frozen
+    assert not tracker.out_of_range, "a stale verdict was carried forward"
 
 
 def test_mismatched_shapes_are_rejected():

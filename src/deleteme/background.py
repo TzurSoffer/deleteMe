@@ -267,7 +267,6 @@ class BackgroundModel:
 
         difference = channel_max(cv2.absdiff(frame_small, corrected_small))
         changed_small = difference > cfg.change_exclusion_threshold
-        changed_fraction = float(np.count_nonzero(changed_small)) / changed_small.size
 
         if person_mask is None:
             person_small = np.zeros(changed_small.shape, np.uint8)
@@ -278,6 +277,17 @@ class BackgroundModel:
                 ellipse_kernel(max(1, round(cfg.person_exclusion_dilate_px / divisor))),
             )
         person_free_small = person_small == 0
+
+        # Measured over the scene, not over the subject. The person differs from
+        # the plate by design — that is the whole point of them — so counting
+        # their silhouette here made the "changed" reading a measure of how
+        # large you are in frame rather than of how stale the plate is. It feeds
+        # the health score and the "plate no longer matches" verdict, so a
+        # close-up subject in front of a perfect plate was reported as broken.
+        visible = int(np.count_nonzero(person_free_small))
+        changed_fraction = (
+            float(np.count_nonzero(changed_small & person_free_small)) / visible if visible else 0.0
+        )
 
         erode_kernel = ellipse_kernel(max(1, round(cfg.background_erode_px / divisor)))
         refresh_small = cv2.erode(person_free_small.astype(np.uint8), erode_kernel)

@@ -145,11 +145,19 @@ def build_lut(gain: np.ndarray, bias: np.ndarray) -> np.ndarray:
 
     Clipping happens in float before the cast. A naive ``(200 * 2).astype(uint8)``
     wraps to 144, which produces bright pixels that suddenly turn dark.
+
+    Rounded, not truncated. ``astype(uint8)`` floors, which throws away up to a
+    full level on every entry and discards a sub-1.0 bias correction outright:
+    ``build_lut(gain=1, bias=0.9)`` came out bit-identical to the identity
+    table, even though a bias move of only 0.3 is enough to trigger a rebuild.
+    That left a permanent ~1 level floor under the health residual, and made
+    this module's own documented "median residual 8.0 to 0.00" untrue of its
+    implementation.
     """
     table = np.empty((1, 256, 3), dtype=np.uint8)
     for channel in range(3):
         values = _RAMP * float(gain[channel]) + float(bias[channel])
-        table[0, :, channel] = np.clip(values, 0.0, 255.0).astype(np.uint8)
+        table[0, :, channel] = np.rint(np.clip(values, 0.0, 255.0)).astype(np.uint8)
     return table
 
 
@@ -228,6 +236,12 @@ class PhotometryTracker:
 
         if fit is None:
             self.frozen = True
+            # Cleared too: a refused fit is not evidence that the scene changed.
+            # Leaving it latched meant one clipped fit followed by a subject
+            # close enough to starve the fit kept reporting "the scene has
+            # changed, not just the light" — which is checked before every other
+            # explanation, so it masked whatever was actually wrong.
+            self.out_of_range = False
             self._history.append((now, float(self.gain.mean())))
             return None
 

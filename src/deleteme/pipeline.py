@@ -73,6 +73,17 @@ class EffectPipeline:
 
         self._feather = self.config.segmentation.feather_kernel_px | 1
         self._closed = False
+        self._was_engaged = False
+
+        # The pipeline owns the worker's whole lifetime, not just its shutdown.
+        # Starting it here rather than at the call site is deliberate: an
+        # unstarted worker fails completely silently — submit() just overwrites
+        # a pending frame, `reading` keeps returning its initial UNKNOWN, the
+        # gate can never engage, and `error` stays None because no thread ever
+        # ran to set it. That is exactly what shipped, and the effect could only
+        # be triggered by the undocumented F key.
+        if self.gesture_worker is not None:
+            self.gesture_worker.start()
 
         self.force: bool | None = None
         """Manual override of the gesture gate.
@@ -110,10 +121,18 @@ class EffectPipeline:
         timings["background"] = (perf_counter() - mark) * 1000.0
 
         if strength <= 1e-3:
-            # Fully visible. Drop the stabiliser's history so the next
-            # activation starts clean rather than fading in last time's shape.
-            if self.dissolve.settled:
+            # Drop the stabiliser's history once, on the frame the effect
+            # finishes switching off, so the next activation starts clean
+            # rather than fading in the last one's shape.
+            #
+            # Once, not every idle frame: `Dissolve.settled` is permanently true
+            # in the steady off state, so resetting on it cleared the EMA at the
+            # top of every idle frame and `mask_ema_alpha` had no effect at all
+            # on the idle path — which is precisely where the background model
+            # does its best learning.
+            if self._was_engaged:
                 self.stabilizer.reset()
+                self._was_engaged = False
             timings["composite"] = 0.0
             return PipelineResult(
                 image=image,
@@ -124,6 +143,8 @@ class EffectPipeline:
                 gesture=reading,
                 timings=timings,
             )
+
+        self._was_engaged = True
 
         mark = perf_counter()
         alpha = self._removal_alpha(image, mask)
@@ -167,6 +188,7 @@ class EffectPipeline:
         self.gate.reset()
         self.dissolve.reset(0.0)
         self.stabilizer.reset()
+        self._was_engaged = False
 
     def close(self) -> None:
         """Shut down in the only safe order.

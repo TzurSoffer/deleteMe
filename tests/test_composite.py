@@ -137,6 +137,45 @@ def test_smoothstep_has_zero_slope_at_both_ends():
     assert smoothstep(0.1) < 0.1
 
 
+class TestDissolveThroughAnActualComposite:
+    """The ramp had no test that ran it through the blend.
+
+    Every dissolve test asserted on the ramp value alone, so `strength` could
+    have been dropped from `Compositor.compose` entirely and nothing would have
+    noticed — the transition would simply have become a hard cut again.
+    """
+
+    def setup_method(self):
+        self.frame = solid_frame(64, 64, (0, 0, 0))
+        self.plate = solid_frame(64, 64, (200, 200, 200))
+        self.alpha = np.ones((64, 64), np.float32)
+        self.compositor = Compositor()
+
+    def value_at(self, strength: float) -> int:
+        out = self.compositor.compose(self.frame, self.plate, self.alpha, strength=strength).image
+        return int(out[32, 32, 0])
+
+    def test_a_partial_ramp_produces_a_partial_blend(self):
+        assert self.value_at(0.5) == pytest.approx(100, abs=2)
+
+    def test_the_ramp_is_monotonic_through_the_blend(self):
+        values = [self.value_at(s) for s in (0.0, 0.25, 0.5, 0.75, 1.0)]
+        assert values == sorted(values)
+        assert values[0] == 0
+        assert values[-1] == 200
+
+    def test_a_real_dissolve_produces_intermediate_frames(self):
+        """At 30 fps a hard cut lasts one frame and reads as a dropped frame."""
+        dissolve = Dissolve(0.165)
+        dissolve.target(True, now=0.0)
+
+        frames = [self.value_at(dissolve.value(t / 30.0)) for t in range(6)]
+
+        assert frames[0] == 0
+        assert frames[-1] > frames[0]
+        assert any(0 < v < 200 for v in frames), "the transition was instantaneous"
+
+
 def test_composite_roi_covers_the_mask():
     frame = textured_frame(320, 240, seed=7)
     plate = textured_frame(320, 240, seed=8)

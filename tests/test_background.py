@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import pytest
 
-from deleteme.background import BackgroundModel, HealthState
+from deleteme.background import BackgroundModel, BumpDetector, HealthState
 from deleteme.config import AppConfig, ChangeMaskConfig
 from deleteme.errors import PlateMismatchError
 from deleteme.frames import solid_frame, textured_frame
@@ -161,17 +161,65 @@ class TestChangeMask:
         assert covered > 0.85, f"only {covered:.0%} of the cast shadow was removed"
 
     def test_an_object_not_touching_the_subject_is_kept(self, model, room):
-        """The connectivity rule in one test: a mug set down on the desk stays
-        visible while the shadow goes, because the shadow touches you."""
+        """The connectivity rule, on its own.
+
+        The object is placed deliberately *inside* the spatial gate. Put it
+        outside, and the gate alone keeps it — so the test passes even with
+        connectivity filtering disabled entirely, and pins nothing. Here the
+        only thing standing between the mug and deletion is that it does not
+        touch the silhouette.
+        """
         mask = person_mask(cx=120)
+        silhouette_area = float((mask > 0).sum())
+        roi_radius = self.model_roi_radius(model, silhouette_area)
+
         frame = room.copy()
         frame[mask > 0] = (20, 18, 16)
-        frame[20:45, 250:290] = (245, 245, 245)  # an isolated bright object
+        # ~25 px clear of the body, comfortably within the gate.
+        frame[110:135, 178:218] = (245, 245, 245)
+        distance = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
+        assert distance[110:135, 178:218].min() < roi_radius, "object must be inside the gate"
+
         model.update(frame, mask, now=0.0)
+        result = model.change_mask(frame, mask, silhouette_area / (HEIGHT * WIDTH))
 
-        result = model.change_mask(frame, mask, float((mask > 0).mean()))
+        assert int((result[110:135, 178:218] > 0).sum()) == 0
+        assert not model.change_mask_suppressed, "kept by connectivity, not by the area guard"
 
-        assert int((result[20:45, 250:290] > 0).sum()) == 0
+    @staticmethod
+    def model_roi_radius(model, silhouette_area: float) -> float:
+        cfg = model.config.change_mask
+        radius = cfg.roi_area_coefficient * float(np.sqrt(silhouette_area))
+        return min(max(radius, cfg.roi_min_px), cfg.roi_max_px)
+
+    def test_change_beyond_the_gate_is_not_removed_even_when_connected(self, model, room):
+        """The spatial gate, on its own.
+
+        A darkened streak running from the subject to the frame edge is a single
+        connected component, so connectivity would happily take all of it, and
+        it is small enough that the area guard never fires. Only the gate stops
+        it — which matters because without a bound, one exposure step turns the
+        whole picture into wallpaper.
+        """
+        mask = person_mask(cx=90, rx=25, ry=55)
+        silhouette_area = float((mask > 0).sum())
+        roi_radius = self.model_roi_radius(model, silhouette_area)
+
+        frame = room.copy()
+        frame[mask > 0] = (20, 18, 16)
+        streak = np.zeros((HEIGHT, WIDTH), np.uint8)
+        streak[118:126, 90:WIDTH] = 255
+        only_streak = (streak > 0) & (mask == 0)
+        frame[only_streak] = (frame[only_streak] * 0.45).astype(np.uint8)
+
+        model.update(frame, mask, now=0.0)
+        result = model.change_mask(frame, mask, silhouette_area / (HEIGHT * WIDTH))
+
+        far_end = result[118:126, WIDTH - 20 :]
+        assert int((far_end > 0).sum()) == 0, "the gate must stop the streak short"
+        assert not model.change_mask_suppressed, "stopped by the gate, not the area guard"
+        near = result[118:126, 90 : 90 + int(roi_radius) // 2]
+        assert int((near > 0).sum()) > 0, "the part inside the gate should still go"
 
     def test_an_uncorrected_exposure_step_cannot_take_the_frame(self, model, room):
         """The failure this guard exists for.
@@ -213,6 +261,46 @@ class TestBumpDetection:
 
         assert not model.bump.alarm
 
+    def test_a_sustained_shift_eventually_raises_the_alarm(self):
+        """Asserted positively, because `alarm` is False in almost every state.
+
+        A test that only ever checks `not alarm` would pass against a detector
+        hard-wired to False, which is no test of a detector at all.
+        """
+        detector = BumpDetector(AppConfig())
+        plate = textured_frame(WIDTH, HEIGHT, seed=77)
+        plate_gray = self.small_gray(plate)
+        shifted_gray = self.small_gray(np.roll(plate, shift=(0, 8), axis=(0, 1)))
+
+        for _ in range(AppConfig().background.drift_sustain_samples + 2):
+            detector.update(plate_gray, shifted_gray)
+
+        assert detector.measurable
+        assert detector.shift_px > AppConfig().background.drift_trigger_px
+        assert detector.alarm, "a sustained shift must eventually be reported"
+
+    def test_the_alarm_stands_down_once_the_camera_is_still_again(self):
+        detector = BumpDetector(AppConfig())
+        plate = textured_frame(WIDTH, HEIGHT, seed=78)
+        plate_gray = self.small_gray(plate)
+        shifted_gray = self.small_gray(np.roll(plate, shift=(0, 8), axis=(0, 1)))
+
+        for _ in range(AppConfig().background.drift_sustain_samples + 2):
+            detector.update(plate_gray, shifted_gray)
+        assert detector.alarm
+
+        for _ in range(AppConfig().background.drift_sustain_samples + 2):
+            detector.update(plate_gray, plate_gray)
+
+        assert not detector.alarm
+
+    @staticmethod
+    def small_gray(image: np.ndarray) -> np.ndarray:
+        divisor = AppConfig().background.drift_scale_divisor
+        size = (image.shape[1] // divisor, image.shape[0] // divisor)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+
     def test_a_textureless_scene_is_reported_as_unmeasurable(self):
         """Phase correlation on a blank wall returns a number, and it means
         nothing. Say so rather than acting on it."""
@@ -224,6 +312,95 @@ class TestBumpDetection:
             model.update(flat, None, now=i * 0.2)
 
         assert not model.bump.measurable
+
+
+class TestChangedFraction:
+    def test_the_subject_is_not_counted_as_a_changed_scene(self, model, room):
+        """`changed_fraction` measures the scene, not the person.
+
+        The subject differs from the plate by definition — that is what makes
+        them the subject. Counting their silhouette made the reading a measure
+        of how large they are in frame, which drove the health score down at
+        every coverage and produced a red "recapture" prompt in front of a
+        perfectly good plate.
+        """
+        mask = person_mask(rx=70, ry=110)
+        frame = room.copy()
+        frame[mask > 0] = (15, 12, 10)  # very different from the plate
+
+        health = model.update(frame, mask, now=0.0)
+
+        assert health.changed_fraction < 0.05, (
+            f"a good plate reported {health.changed_fraction:.0%} of the scene changed"
+        )
+
+    def test_a_genuinely_changed_scene_is_still_counted(self, model, room):
+        other = textured_frame(WIDTH, HEIGHT, seed=98)
+
+        health = model.update(other, None, now=0.0)
+
+        assert health.changed_fraction > 0.5
+
+    def test_a_close_up_subject_over_a_good_plate_is_not_called_broken(self, model, room):
+        """The user-visible symptom: lean towards the camera, get told the
+        background is wrong."""
+        mask = np.full((HEIGHT, WIDTH), 255, np.uint8)
+        mask[:8, :8] = 0  # a sliver of visible background
+        frame = room.copy()
+        frame[mask > 0] = (15, 12, 10)
+
+        health = model.update(frame, mask, now=0.0)
+
+        assert health.state is not HealthState.BAD
+
+
+class TestPlateRefresh:
+    def test_a_lasting_scene_change_is_eventually_learned(self, room):
+        """Continuous relearning. Without it the plate is a photograph again."""
+        config = AppConfig()
+        model = BackgroundModel(config)
+        model.adopt(Plate(room.copy(), PlateMetadata(width=WIDTH, height=HEIGHT, noise_sigma=0.5)))
+
+        moved = room.copy()
+        moved[150:200, 40:100] = (200, 60, 40)  # an object put down and left
+
+        before = int(cv2.absdiff(model.plate_image, moved)[150:200, 40:100].sum())
+        for i in range(900):
+            model.update(moved, None, now=i / 30)
+        after = int(cv2.absdiff(model.plate_image, moved)[150:200, 40:100].sum())
+
+        assert after < before / 2, "the plate never learned a change that stayed put"
+
+    def test_a_person_who_holds_still_cannot_burn_into_the_plate(self, room):
+        """Anti-burn-in. A stationary subject is excluded by the person mask,
+        and the two-speed commit is the backstop for when that mask fails."""
+        model = BackgroundModel(AppConfig())
+        model.adopt(Plate(room.copy(), PlateMetadata(width=WIDTH, height=HEIGHT, noise_sigma=0.5)))
+
+        mask = person_mask()
+        frame = room.copy()
+        frame[mask > 0] = (18, 16, 14)
+
+        untouched = model.plate_image[mask > 0].copy()
+        for i in range(900):
+            model.update(frame, mask, now=i / 30)
+
+        assert np.array_equal(model.plate_image[mask > 0], untouched), (
+            "a stationary person was averaged into the background"
+        )
+
+    def test_relearning_stands_down_while_the_light_is_moving(self, room):
+        """Averaging a half-adjusted exposure into the plate bakes in a value
+        that was never correct at any moment."""
+        model = BackgroundModel(AppConfig())
+        model.adopt(Plate(room.copy(), PlateMetadata(width=WIDTH, height=HEIGHT, noise_sigma=0.5)))
+        original = model.plate_image.copy()
+
+        for i in range(60):
+            gain = 1.0 + 0.3 * (i / 60)  # light moving continuously
+            model.update(relight(room, gain), None, now=i / 30)
+
+        assert np.array_equal(model.plate_image, original), "the plate was updated mid-transition"
 
 
 class TestIdleTracking:

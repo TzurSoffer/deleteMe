@@ -136,12 +136,19 @@ class _CaptureWorker(threading.Thread):
 
         if camera is not None:
             self._publish(None, 0.0, "letting the camera settle")
-            camera.warm_up()
+            # The cancel token goes all the way down. Both of these run for
+            # seconds — the exposure probe can take 96 camera reads against a
+            # driver that accepts every request without honouring it — and a
+            # shutdown that cannot get this thread out in time would end up
+            # releasing the capture while it is still inside cap.read().
+            camera.warm_up(cancel=self._cancel)
             if self._cancel.is_set():
                 return
             if self._relock:
                 self._publish(None, 0.0, "checking what this camera will let us pin down")
-                lock = camera.lock_photometry()
+                lock = camera.lock_photometry(cancel=self._cancel)
+                if self._cancel.is_set():
+                    return
                 if not lock.verified:
                     log.info("exposure could not be pinned; software correction will carry it")
 
@@ -216,6 +223,7 @@ class DeleteMeApp:
         self._photo: ImageTk.PhotoImage | None = None
         self._frame_times: list[float] = []
         self._stalled_since: float | None = None
+        self._tick_errors = 0
 
         self._build_window()
         self._load_existing_plate()
@@ -229,7 +237,13 @@ class DeleteMeApp:
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
-        self.video = tk.Label(self.root, background="#0d1117", width=width, height=height)
+        # Sized by a blank placeholder image rather than by width/height. On a
+        # Label with no image those options are in *text* units, so 640x480
+        # asks for a window of about 4486x7206 pixels — and with
+        # resizable(False, False) the user cannot shrink it, leaving the buttons
+        # and status line thousands of pixels off-screen until a frame arrives.
+        self._blank = tk.PhotoImage(width=width, height=height)
+        self.video = tk.Label(self.root, background="#0d1117", image=self._blank)
         self.video.pack()
 
         controls = ttk.Frame(self.root, padding=(10, 8))
@@ -385,10 +399,28 @@ class DeleteMeApp:
     # ------------------------------------------------------------------ loop
 
     def _tick(self) -> None:
+        """One frame, then reschedule — and reschedule *whatever happens*.
+
+        Tk catches an exception raised in an ``after`` callback, prints it to a
+        stderr that a windowed launch has no console for, and returns. Nothing
+        re-arms the chain, so a single unexpected error used to stop the video
+        permanently: the last frame stayed frozen on screen, capture appeared to
+        do nothing, and there was no message anywhere the user would see.
+        """
         if self._closing:
             return
         started = perf_counter()
+        try:
+            self._tick_once()
+        except Exception:
+            self._on_tick_error()
+        finally:
+            if not self._closing:
+                elapsed = perf_counter() - started
+                delay = max(1, int((1.0 / self.config.camera.fps - elapsed) * 1000))
+                self._after_id = self.root.after(delay, self._tick)
 
+    def _tick_once(self) -> None:
         worker = self._worker
         if worker is not None and worker.finished.is_set():
             self._finish_capture(worker)
@@ -402,12 +434,36 @@ class DeleteMeApp:
         else:
             self._tick_frame()
 
-        elapsed = perf_counter() - started
-        delay = max(1, int((1.0 / self.config.camera.fps - elapsed) * 1000))
-        self._after_id = self.root.after(delay, self._tick)
+    def _on_tick_error(self) -> None:
+        """Report a frame failure without abandoning the loop.
+
+        Transient causes exist — a disk that filled up under ``--record``, one
+        undecodable frame in a replay — so a single failure is logged and the
+        loop continues. A run of them means something structural, and at that
+        point the honest thing is to stop and say so rather than spin.
+        """
+        self._tick_errors += 1
+        log.exception("frame processing failed (%d in a row)", self._tick_errors)
+        if self._tick_errors < 30:
+            self.status.set("A frame could not be processed. Still running.")
+            return
+
+        self._closing = True
+        messagebox.showerror(
+            "DeleteMe has stopped",
+            "Too many frames failed in a row, so processing has been stopped.\n\n"
+            "Run `deleteme --log-level DEBUG` from a terminal to see why.",
+        )
+        self.quit()
 
     def _tick_frame(self) -> None:
-        frame = self.source.read()
+        # A short wait, not the full read timeout: this is the UI thread, and
+        # blocking it for five seconds on a camera that has stopped delivering
+        # freezes the window exactly when the user needs it to still respond.
+        if isinstance(self.source, CameraSession):
+            frame = self.source.read(timeout_s=2.0 / max(1, self.config.camera.fps))
+        else:
+            frame = self.source.read()
         now = perf_counter()
 
         if frame is None:
@@ -427,6 +483,7 @@ class DeleteMeApp:
         # debounce and dissolve in the system.
         result = self.pipeline.process(Frame(frame.image, frame.index, now))
 
+        self._tick_errors = 0
         self._sample_fps(now)
         self._maybe_auto_recapture(frame, now)
         self._render(result.image)
@@ -558,16 +615,28 @@ class DeleteMeApp:
                 self.root.after_cancel(self._after_id)
 
         worker = self._worker
+        stranded = False
         if worker is not None:
             worker.cancel()
-            worker.join(timeout=3.0)
+            worker.join(timeout=5.0)
+            stranded = worker.is_alive()
+            if stranded:  # pragma: no cover - needs a wedged driver
+                log.error(
+                    "the background-capture thread did not stop; leaving the camera open rather "
+                    "than releasing it underneath a live cv2.VideoCapture call"
+                )
 
         if isinstance(self.source, CameraSession):
             self.source.stop_stream()
 
         self.pipeline.close()
 
-        self.source.close()
+        # Releasing the capture while that worker is still inside cap.read() is
+        # a use-after-free in native code, which no exception handler can catch.
+        # Leaking one VideoCapture on the way out of a process that is exiting
+        # anyway is strictly the better outcome.
+        if not stranded:
+            self.source.close()
         if self.recorder is not None:
             self.recorder.close()
 

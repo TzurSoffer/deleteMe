@@ -27,12 +27,12 @@ def noisy(image, rng, sigma=0.5):
     )
 
 
-def feed(capture, image, count, *, empty=True, start=0.0, rng=None):
+def feed(capture, image, count, *, empty=True, start=0.0, rng=None, sigma=0.5):
     """Offer a run of frames, returning the last verdict."""
     rng = rng or np.random.default_rng(0)
     verdict = None
     for i in range(count):
-        verdict = capture.offer(noisy(image, rng), empty, start + i / 30)
+        verdict = capture.offer(noisy(image, rng, sigma), empty, start + i / 30)
     return verdict
 
 
@@ -100,6 +100,38 @@ class TestQualityGate:
         feed(capture, room, 12)
         assert 0.0 < capture.progress() <= 1.0
 
+    def test_a_moving_scene_is_refused_until_it_settles(self, room):
+        """The "has stopped moving" check, which had no test of its own.
+
+        Both halves matter and fail differently: the spread of mean luma
+        catches an auto-exposure still hunting, and the mean frame difference
+        catches something physically moving in shot.
+        """
+        capture = PlateCapture(PlateConfig(required_good_frames=5))
+        rng = np.random.default_rng(7)
+
+        # A scene that is still changing substantially frame to frame.
+        for i in range(20):
+            moving = room.copy()
+            moving[:, (i * 13) % 300 : (i * 13) % 300 + 18] = 0
+            capture.offer(noisy(moving, rng), True, i / 30)
+        assert not capture.complete, "a moving scene was accepted"
+
+        # Now let it settle.
+        verdict = feed(capture, room, 20, start=1.0, rng=rng)
+        assert verdict is not None and verdict.stable
+        assert capture.complete
+
+    def test_a_drifting_exposure_is_refused(self, room):
+        capture = PlateCapture(PlateConfig(required_good_frames=5))
+        rng = np.random.default_rng(8)
+
+        for i in range(20):
+            drifting = np.clip(room.astype(np.float32) * (1.0 + 0.02 * i), 0, 255).astype(np.uint8)
+            capture.offer(noisy(drifting, rng), True, i / 30)
+
+        assert not capture.complete, "a plate was taken mid-convergence"
+
     def test_timeout_is_reported_rather_than_hanging(self, room):
         capture = PlateCapture(PlateConfig(required_good_frames=5, timeout_s=1.0))
         capture.offer(room, False, 0.0)
@@ -108,17 +140,43 @@ class TestQualityGate:
 
 
 class TestStacking:
-    def test_the_stack_is_a_median_and_suppresses_noise(self, room):
-        capture = PlateCapture(PlateConfig(required_good_frames=15))
+    def test_the_stack_suppresses_noise_rather_than_just_claiming_to(self, room):
+        """Asserts the pixels, not the label.
+
+        Checking `capture_method == "median"` proves only that a string was
+        written. What matters is that stacking actually reduces the error
+        against the noise-free scene, which is the whole reason for it.
+        """
+        # The stability check would (correctly) refuse noise this heavy, and
+        # this test is about the stacking arithmetic rather than the gate, so
+        # the gate is widened to admit exactly the noise being injected.
+        capture = PlateCapture(
+            PlateConfig(required_good_frames=15, max_frame_delta=20.0, max_luma_spread=10.0)
+        )
         rng = np.random.default_rng(2)
-        feed(capture, room, 30, rng=rng)
+        feed(capture, room, 30, rng=rng, sigma=6.0)
         assert capture.complete
 
         plate = capture.build("test", 0, PhotometryLock())
 
-        assert plate.metadata.capture_method == "median"
+        single = float(np.mean(cv2.absdiff(noisy(room, np.random.default_rng(9), 6.0), room)))
+        stacked = float(np.mean(cv2.absdiff(plate.image, room)))
+        assert stacked < single / 2, f"stacking barely helped: {single:.2f} -> {stacked:.2f}"
         assert plate.metadata.frames_averaged >= 15
-        assert plate.image.shape == room.shape
+
+    def test_one_bad_frame_cannot_drag_the_stack(self, room):
+        """A median, not a mean: immune to a single outlier sneaking in."""
+        capture = PlateCapture(PlateConfig(required_good_frames=11))
+        rng = np.random.default_rng(4)
+        for i in range(11):
+            image = noisy(room, rng)
+            if i == 5:
+                image = np.full_like(image, 255)  # a flash, a passing headlight
+            capture._accepted.append(image)
+
+        plate = capture.build("test", 0, PhotometryLock())
+
+        assert float(np.mean(cv2.absdiff(plate.image, room))) < 3.0
 
     def test_noise_sigma_is_measured_from_the_stack(self, room):
         """This is what calibrates change detection to *this* camera rather

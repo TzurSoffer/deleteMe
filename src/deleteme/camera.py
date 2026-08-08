@@ -108,7 +108,7 @@ class _LatestFrameSlot:
     def put(self, frame: Frame) -> None:
         with self._lock:
             self._frame = frame
-        self._arrived.set()
+            self._arrived.set()
 
     def take(self, timeout: float) -> Frame | None:
         if not self._arrived.wait(timeout):
@@ -118,9 +118,16 @@ class _LatestFrameSlot:
             self._arrived.clear()
         return frame
 
-    def peek(self) -> Frame | None:
+    def clear(self) -> None:
+        """Forget any frame already waiting.
+
+        Called when streaming stops, so the first frame after a pause is a live
+        one rather than one captured before it — which, after plate capture,
+        would be a frame from before the camera was reconfigured.
+        """
         with self._lock:
-            return self._frame
+            self._frame = None
+            self._arrived.clear()
 
 
 class CameraSession:
@@ -219,10 +226,17 @@ class CameraSession:
     def is_streaming(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def read(self) -> Frame | None:
-        """Most recent frame. ``None`` means "not right now", never "give up"."""
+    def read(self, timeout_s: float | None = None) -> Frame | None:
+        """Most recent frame. ``None`` means "not right now", never "give up".
+
+        The caller chooses how long to wait. The UI thread must pass something
+        around a frame interval: blocking it for the full default would freeze
+        the window for five seconds on a camera that has stopped delivering,
+        which is precisely when the user needs the window to still work.
+        """
         if self.is_streaming:
-            frame = self._slot.take(self.config.read_timeout_s)
+            wait = self.config.read_timeout_s if timeout_s is None else timeout_s
+            frame = self._slot.take(wait)
         else:
             image = self._read_direct(self._require_cap())
             frame = self._wrap(image) if image is not None else None
@@ -299,10 +313,11 @@ class CameraSession:
             if thread.is_alive():  # pragma: no cover - pathological driver hang
                 log.warning("capture thread did not stop within 2s")
         self._thread = None
+        self._slot.clear()
 
     # ------------------------------------------------------------- photometry
 
-    def warm_up(self, frames: int | None = None) -> None:
+    def warm_up(self, frames: int | None = None, cancel: threading.Event | None = None) -> None:
         """Discard frames so the driver's auto algorithms can converge.
 
         Locking before they settle pins the wrong values — which is exactly what
@@ -312,10 +327,18 @@ class CameraSession:
         count = self.config.warmup_frames if frames is None else frames
         cap = self._require_cap()
         for _ in range(count):
+            if cancel is not None and cancel.is_set():
+                return
             self._read_direct(cap)
 
-    def lock_photometry(self) -> PhotometryLock:
-        """Pin exposure, white balance and focus, verifying each by experiment."""
+    def lock_photometry(self, cancel: threading.Event | None = None) -> PhotometryLock:
+        """Pin exposure, white balance and focus, verifying each by experiment.
+
+        ``cancel`` is checked between camera operations. Without it this runs
+        for seconds — up to 96 camera reads when a driver accepts every request
+        without honouring it — during which a shutdown cannot get the thread out
+        before something else releases the capture underneath it.
+        """
         if not self.config.lock_photometry:
             return PhotometryLock(failures=["disabled by configuration"])
 
@@ -330,7 +353,7 @@ class CameraSession:
             "gain": cap.get(cv2.CAP_PROP_GAIN),
         }
 
-        manual_value = self._take_manual_exposure(cap, converged["exposure"])
+        manual_value = self._take_manual_exposure(cap, converged["exposure"], cancel)
         verified = manual_value is not None
         if manual_value is not None:
             # Record the value that *worked*, not what the driver reports back.
@@ -368,49 +391,70 @@ class CameraSession:
         return self.lock
 
     def _take_manual_exposure(
-        self, cap: cv2.VideoCapture, converged_exposure: float
+        self,
+        cap: cv2.VideoCapture,
+        converged_exposure: float,
+        cancel: threading.Event | None = None,
     ) -> float | None:
         """Try each manual sentinel until exposure demonstrably responds to us.
 
         Returns the sentinel that worked, or ``None`` if none did.
         """
         for candidate in _MANUAL_AUTO_EXPOSURE_CANDIDATES:
+            if cancel is not None and cancel.is_set():
+                return None
             if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, candidate):
                 continue
-            if self._exposure_responds(cap, converged_exposure):
+            if self._exposure_responds(cap, converged_exposure, cancel):
                 log.debug("exposure came under manual control at AUTO_EXPOSURE=%s", candidate)
                 return candidate
         return None
 
-    def _exposure_responds(self, cap: cv2.VideoCapture, baseline_exposure: float) -> bool:
+    def _exposure_responds(
+        self,
+        cap: cv2.VideoCapture,
+        baseline_exposure: float,
+        cancel: threading.Event | None = None,
+    ) -> bool:
         """Change the exposure and check whether the picture actually changed.
 
         The only trustworthy test. Read-back alone is not enough — DSHOW returns
         -1 for ``AUTO_EXPOSURE`` whether or not the request was honoured.
         """
-        base_luma = self._mean_luma(cap)
+        base_luma = self._mean_luma(cap, cancel=cancel)
         if base_luma is None:
             return False
 
         probe = baseline_exposure + self.config.exposure_probe_stops
         if not cap.set(cv2.CAP_PROP_EXPOSURE, probe):
             return False
-        probe_luma = self._mean_luma(cap)
+        probe_luma = self._mean_luma(cap, cancel=cancel)
 
+        # Restore the original exposure even when cancelled, so a shutdown does
+        # not leave the camera sitting at a probe value.
         cap.set(cv2.CAP_PROP_EXPOSURE, baseline_exposure)
-        self._mean_luma(cap)  # let it settle back before anyone else looks
+        self._mean_luma(cap, cancel=cancel)  # let it settle before anyone else looks
 
         if probe_luma is None:
             return False
         return abs(probe_luma - base_luma) >= self.config.exposure_probe_min_delta_luma
 
     @staticmethod
-    def _mean_luma(cap: cv2.VideoCapture, discard: int = 5, average: int = 3) -> float | None:
+    def _mean_luma(
+        cap: cv2.VideoCapture,
+        discard: int = 5,
+        average: int = 3,
+        cancel: threading.Event | None = None,
+    ) -> float | None:
         """Mean luma after letting the sensor settle."""
         for _ in range(discard):
+            if cancel is not None and cancel.is_set():
+                return None
             cap.read()
         readings: list[float] = []
         for _ in range(average):
+            if cancel is not None and cancel.is_set():
+                return None
             ok, image = cap.read()
             if ok and image is not None and image.size:
                 readings.append(float(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).mean()))
