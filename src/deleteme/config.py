@@ -116,6 +116,11 @@ class BackgroundConfig:
     change_exclusion_threshold: float = 40.0
     background_erode_px: int = 5
 
+    # Note: there is deliberately no "minimum coverage before relaxing the fit
+    # mask" setting here. That decision is made by trying the fit and seeing
+    # whether it succeeds — see PhotometryTracker.update — so it cannot drift
+    # out of agreement with min_fit_pixels.
+
     refresh_every_n_frames: int = 3
     candidate_alpha: float = 0.05
     committed_alpha: float = 0.01
@@ -134,7 +139,15 @@ class BackgroundConfig:
     drift_sustain_samples: int = 15
     drift_min_gradient_energy: float = 12.0
 
-    staleness_scale_divisor: int = 4
+    coarse_divisor: int = 4
+    """Downscale factor for the model's bookkeeping.
+
+    Mask building, staleness ageing and refresh-stability tracking all work at
+    this scale. None of them need per-pixel precision — they are about regions
+    tens of pixels across — and full-resolution float32 arithmetic measured
+    several times more expensive for an identical decision.
+    """
+
     stale_after_s: float = 10.0
     """A region unseen for this long is counted as stale. Enough of the frame
     going stale is the cue that the plate is describing a room that may no
@@ -179,15 +192,16 @@ class ChangeMaskConfig:
     enabled: bool = True
 
     roi_min_px: int = 40
-    roi_max_px: int = 170
-    roi_area_coefficient: float = 0.55
+    roi_max_px: int = 220
+    roi_area_coefficient: float = 0.9
     """The spatial gate's *radius*, scaled by sqrt(silhouette area).
 
     A gate is not optional: without one, a single auto-exposure step makes every
     pixel differ from the plate and the whole frame turns into wallpaper. But a
     fixed 40 px gate cannot reach a cast shadow, which routinely falls a body's
     width away — measured at 105 px for a seated subject. Since a shadow scales
-    with its owner, so does the gate.
+    with its owner, so does the gate: the coefficient is set so the gate reaches
+    roughly one "characteristic body size", sqrt(silhouette area).
 
     Distance is only a proxy for safety, though. The real guard is
     ``max_expansion_ratio`` below, which bounds the damage directly.

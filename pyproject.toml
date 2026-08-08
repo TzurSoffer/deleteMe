@@ -30,6 +30,11 @@ dependencies = [
     "mediapipe>=1.0,<2",
     "numpy>=2,<3",
     "opencv-contrib-python>=4.10,<6",
+    # Pillow arrives transitively anyway (mediapipe -> matplotlib), but the Tk
+    # render loop imports it directly, so it is declared directly. It is worth
+    # the line: ImageTk.paste measured 1.02 ms/frame against 5.50 ms for a
+    # fresh pure-tkinter PPM PhotoImage.
+    "pillow>=10",
 ]
 
 [project.optional-dependencies]
@@ -46,10 +51,10 @@ Issues = "https://github.com/TzurSoffer/deleteMe/issues"
 # gui-scripts, not scripts: on Windows this produces a console-less launcher, so
 # starting the app does not also open a command window behind it.
 [project.gui-scripts]
-deleteme = "deleteme.app:main"
+deleteme = "deleteme.cli:main"
 
 [project.scripts]
-deleteme-cli = "deleteme.__main__:main"
+deleteme-cli = "deleteme.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

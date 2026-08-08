@@ -43,14 +43,22 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def fetch(name: str, url: str, expected: str, target_dir: Path, force: bool) -> bool:
+def fetch(
+    name: str, url: str, expected: str, target_dir: Path, force: bool, verify_only: bool = False
+) -> bool:
     target = target_dir / name
     if target.is_file() and not force:
         actual = sha256(target)
         if actual == expected:
             print(f"  {name}: present and verified")
             return True
-        print(f"  {name}: digest mismatch ({actual[:12]}...), re-downloading")
+        print(f"  {name}: digest mismatch ({actual[:12]}..., expected {expected[:12]}...)")
+        if verify_only:
+            return False
+        print(f"  {name}: re-downloading")
+    elif verify_only:
+        print(f"  {name}: MISSING")
+        return False
 
     target_dir.mkdir(parents=True, exist_ok=True)
     print(f"  {name}: downloading from {url}")
@@ -71,15 +79,21 @@ def fetch(name: str, url: str, expected: str, target_dir: Path, force: bool) -> 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--force", action="store_true", help="re-download even if present")
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="check the bundled models against their digests without touching the network",
+    )
     parser.add_argument("--dir", type=Path, default=None, help="target directory")
     args = parser.parse_args(argv)
 
     target_dir = args.dir or (package_root() / "models")
     print(f"Model directory: {target_dir}")
-    ok = all(
-        fetch(name, url, digest, target_dir, args.force) for name, (url, digest) in MODELS.items()
-    )
-    return 0 if ok else 1
+    results = [
+        fetch(name, url, digest, target_dir, args.force, args.verify_only)
+        for name, (url, digest) in MODELS.items()
+    ]
+    return 0 if all(results) else 1
 
 
 if __name__ == "__main__":

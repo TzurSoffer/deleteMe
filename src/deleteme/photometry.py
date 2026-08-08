@@ -183,6 +183,9 @@ class PhotometryTracker:
         self.out_of_range = False
         """True when the fit wanted a correction beyond the sane limits, which
         means the *scene* changed rather than the light."""
+        self.used_fallback = False
+        """True when the preferred mask starved the fit and the fallback was
+        used instead. See :meth:`update`."""
 
         self._history: deque[tuple[float, float]] = deque(maxlen=64)
 
@@ -196,10 +199,32 @@ class PhotometryTracker:
         frame: np.ndarray,
         mask: np.ndarray | None,
         now: float,
+        fallback_mask: np.ndarray | None = None,
     ) -> GainBias | None:
-        """Fit this frame and fold the result into the smoothed parameters."""
+        """Fit this frame and fold the result into the smoothed parameters.
+
+        ``mask`` is the preferred selection. ``fallback_mask`` is a wider one
+        tried only if the preferred mask leaves too little to fit against.
+
+        That fallback resolves a deadlock rather than being belt-and-braces.
+        The caller's preferred mask excludes pixels that differ from the
+        *corrected* plate, so before any correction has been learned a genuine
+        lighting change marks most of the frame as changed: a 25% brightening
+        puts 57.5% of pixels over the threshold, leaving too few to fit, so the
+        model would refuse to learn precisely the change it exists to handle —
+        and the bigger the change, the more certainly it would refuse.
+
+        Deciding this by trying the fit, rather than by a separate coverage
+        threshold, means there is no second number to keep in agreement with
+        ``min_fit_pixels``. An earlier version had exactly that bug: it relaxed
+        below 12% coverage while the fit needed 32.6%.
+        """
         cfg = self.config
         fit = fit_gain_bias(plate, frame, mask, cfg)
+        self.used_fallback = False
+        if fit is None and fallback_mask is not None:
+            fit = fit_gain_bias(plate, frame, fallback_mask, cfg)
+            self.used_fallback = fit is not None
 
         if fit is None:
             self.frozen = True
@@ -263,4 +288,5 @@ class PhotometryTracker:
         self.last_fit = None
         self.frozen = False
         self.out_of_range = False
+        self.used_fallback = False
         self._history.clear()

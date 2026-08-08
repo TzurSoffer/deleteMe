@@ -177,12 +177,16 @@ def solid_frame(width: int, height: int, colour: tuple[int, int, int]) -> np.nda
 
 
 def textured_frame(width: int, height: int, seed: int = 0) -> np.ndarray:
-    """A deterministic textured image with enough variance to fit gain against.
+    """A deterministic stand-in for a real room.
 
-    Photometric fitting needs contrast: on a flat wall the gain term is
-    unidentifiable. Tests that exercise the real fit path must use this rather
-    than :func:`solid_frame`.
+    Two properties matter, for two different callers. Coarse blocks give the
+    large-scale contrast that photometric fitting needs — on a flat wall the
+    gain term is unidentifiable. Fine per-pixel detail gives the high-frequency
+    energy that the plate quality gate reads as "in focus"; a smoothly
+    interpolated image is, correctly, rejected as blurred.
     """
     rng = np.random.default_rng(seed)
-    base = rng.integers(40, 210, size=(height // 8 + 1, width // 8 + 1, 3), dtype=np.uint8)
-    return cv2.resize(base, (width, height), interpolation=cv2.INTER_LINEAR)
+    blocks = rng.integers(40, 210, size=(height // 16 + 1, width // 16 + 1, 3), dtype=np.uint8)
+    image = cv2.resize(blocks, (width, height), interpolation=cv2.INTER_NEAREST)
+    detail = rng.integers(-14, 15, size=(height, width, 1), dtype=np.int16)
+    return np.clip(image.astype(np.int16) + detail, 0, 255).astype(np.uint8)

@@ -154,7 +154,7 @@ class BackgroundModel:
         self._plate_u8: np.ndarray | None = None
         self._candidate: np.ndarray | None = None
         self._committed: np.ndarray | None = None
-        self._previous_candidate: np.ndarray | None = None
+        self._previous_small: np.ndarray | None = None
         self._stable_ticks: np.ndarray | None = None
         self._age_s: np.ndarray | None = None
 
@@ -173,6 +173,9 @@ class BackgroundModel:
 
         self.empty_scene_since: float | None = None
         self.last_health = Health.unknown("no background captured yet")
+        self.fit_relaxed = False
+        """Set when the last update fitted without the changed-pixel exclusion,
+        because keeping it would have left too little to fit against."""
         self.change_mask_suppressed = False
         """Set when the last :meth:`change_mask` call overreached and was
         discarded. Surfaced on the HUD, because silently doing less than asked
@@ -200,13 +203,13 @@ class BackgroundModel:
         committed = plate.image.astype(np.float32)
         self._committed = committed
         self._candidate = committed.copy()
-        self._previous_candidate = committed.copy()
-        self._stable_ticks = np.zeros(plate.image.shape[:2], np.uint16)
-
-        divisor = self.config.background.staleness_scale_divisor
-        self._age_s = np.zeros(
-            (plate.image.shape[0] // divisor, plate.image.shape[1] // divisor), np.float32
+        divisor = max(1, self.config.background.coarse_divisor)
+        coarse = (plate.image.shape[0] // divisor, plate.image.shape[1] // divisor)
+        self._stable_ticks = np.zeros(coarse, np.uint16)
+        self._previous_small = cv2.resize(
+            plate.image, (coarse[1], coarse[0]), interpolation=cv2.INTER_AREA
         )
+        self._age_s = np.zeros(coarse, np.float32)
 
         self.photometry.reset()
         self.bump.reset()
@@ -253,7 +256,7 @@ class BackgroundModel:
         self._frames += 1
 
         cfg = self.config.background
-        divisor = max(1, cfg.staleness_scale_divisor)
+        divisor = max(1, cfg.coarse_divisor)
         height, width = frame.shape[:2]
         small_size = (width // divisor, height // divisor)
 
@@ -278,15 +281,24 @@ class BackgroundModel:
 
         erode_kernel = ellipse_kernel(max(1, round(cfg.background_erode_px / divisor)))
         refresh_small = cv2.erode(person_free_small.astype(np.uint8), erode_kernel)
-        fit_small = cv2.erode((person_free_small & ~changed_small).astype(np.uint8), erode_kernel)
+        strict_small = cv2.erode(
+            (person_free_small & ~changed_small).astype(np.uint8), erode_kernel
+        )
 
-        fit_mask = cv2.resize(fit_small, (width, height), interpolation=cv2.INTER_NEAREST)
+        strict_mask = cv2.resize(strict_small, (width, height), interpolation=cv2.INTER_NEAREST)
         refresh_mask = cv2.resize(refresh_small, (width, height), interpolation=cv2.INTER_NEAREST)
 
-        fit = self.photometry.update(self._plate_u8, frame, fit_mask, now)
-        if fit is not None:
-            # The correction moved, so the cached corrected plate is stale.
-            self._corrected_from = None
+        # No explicit cache invalidation here. `corrected_plate` keys its cache
+        # on the lookup table object itself, and the tracker only builds a new
+        # one when the smoothed parameters leave their deadband — a few times a
+        # second rather than thirty. Invalidating on every successful fit would
+        # throw that away and re-map the whole plate every frame.
+        # Prefer the strict mask, which keeps a moved chair from dragging the
+        # fit, but let the tracker widen to everything-but-the-person when the
+        # strict one leaves too little to fit against.
+        self.photometry.update(self._plate_u8, frame, strict_mask, now, fallback_mask=refresh_mask)
+        self.fit_relaxed = self.photometry.used_fallback
+        fit_small = refresh_small if self.fit_relaxed else strict_small
 
         self._refresh(frame, refresh_mask, now)
         self._update_drift(frame, person_small, now)
@@ -318,8 +330,8 @@ class BackgroundModel:
         if self._frames % max(1, cfg.refresh_every_n_frames) != 0:
             return
         candidate, committed = self._candidate, self._committed
-        previous, ticks = self._previous_candidate, self._stable_ticks
-        if candidate is None or committed is None or previous is None or ticks is None:
+        previous_small, ticks = self._previous_small, self._stable_ticks
+        if candidate is None or committed is None or previous_small is None or ticks is None:
             return
 
         # Never learn during a lighting transition: averaging a half-adjusted
@@ -340,26 +352,35 @@ class BackgroundModel:
             ),
         )
 
-        # (ticks + 1) * settled, in place. Boolean fancy indexing over a full
-        # frame allocates two index arrays per call and was the largest single
-        # cost in this method; three vectorised passes are an order cheaper.
-        # The clamp keeps a pixel that has been quiet for hours from wrapping
-        # the counter around to zero and briefly un-committing itself.
-        movement = channel_max(cv2.absdiff(candidate, previous))
-        settled = (movement < 2.0).astype(np.uint16)
+        # Stability is judged on a quarter-scale uint8 copy. The question is
+        # whether a *region* has stopped arguing about its value, which does not
+        # need per-pixel precision — and full-resolution float32 differencing
+        # measured roughly 3.7x the cost of this for the same answer.
+        coarse = (ticks.shape[1], ticks.shape[0])
+        candidate_u8 = cv2.convertScaleAbs(candidate)
+        candidate_small = cv2.resize(candidate_u8, coarse, interpolation=cv2.INTER_AREA)
+        movement = channel_max(cv2.absdiff(candidate_small, previous_small))
+        np.copyto(previous_small, candidate_small)
+
+        # (ticks + 1) * settled, vectorised. Boolean fancy indexing allocates
+        # two index arrays per call; this does not. The clamp keeps a pixel that
+        # has been quiet for hours from wrapping its counter back to zero and
+        # briefly un-committing itself.
+        settled = (movement < 2).astype(np.uint16)
         ticks += 1
         ticks *= settled
         np.minimum(ticks, ticks_needed, out=ticks)
 
-        ready = (ticks >= ticks_needed).astype(np.uint8)
-        if np.any(ready):
+        ready_small = (ticks >= ticks_needed).astype(np.uint8)
+        if np.any(ready_small):
+            ready = cv2.resize(
+                ready_small, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST
+            )
             cv2.accumulateWeighted(candidate, committed, cfg.committed_alpha, mask=ready)
             # Safe here, unlike in photometry: an average of uint8 pixels is
             # non-negative, so convertScaleAbs's absolute value never fires.
             self._plate_u8 = cv2.convertScaleAbs(committed)
             self._corrected_from = None
-
-        np.copyto(previous, candidate)
 
     # ------------------------------------------------------------------ drift
 
@@ -438,6 +459,23 @@ class BackgroundModel:
         bias = tuple(float(b) for b in self.photometry.bias)
 
         if fit_pixels < 64:
+            # Two very different situations produce the same symptom, and
+            # conflating them would either cry wolf or stay silent when it
+            # matters. Almost nothing matching the plate *and* almost everything
+            # in the frame having changed means the plate describes a room that
+            # is no longer there. A person simply filling the frame leaves the
+            # measurement impossible but the plate perfectly good.
+            if changed_fraction > 0.8:
+                return Health(
+                    state=HealthState.BAD,
+                    score=0.0,
+                    reason="the background no longer matches — recapture",
+                    changed_fraction=changed_fraction,
+                    stale_fraction=stale_fraction,
+                    fit_pixels=fit_pixels,
+                    gain=gain,  # type: ignore[arg-type]
+                    bias=bias,  # type: ignore[arg-type]
+                )
             return Health.unknown("not enough visible background to judge")
 
         residual = float(np.median(difference_small[fit_small].astype(np.float32)))

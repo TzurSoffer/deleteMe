@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check src tests
+      - run: ruff format --check src tests
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # OpenCV links against libGL even for headless use, and the runner image
+      # does not ship it. Installing opencv-*-headless instead is not an option
+      # here: mediapipe depends on opencv-contrib-python specifically, and the
+      # distributions overwrite each other's cv2 module.
+      - name: Install OpenCV's system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 || sudo apt-get install -y libgl1-mesa-glx
+          sudo apt-get install -y libglib2.0-0t64 || sudo apt-get install -y libglib2.0-0
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # mediapipe publishes no `requires_python` on PyPI, so pip performs no
+      # interpreter gating for it whatsoever — it will happily install a wheel
+      # that cannot import. This is the only thing standing between a green
+      # matrix and a broken one.
+      - name: Import smoke test
+        run: |
+          python -c "import mediapipe, cv2, numpy; print('mediapipe', mediapipe.__version__); print('cv2', cv2.__version__); print('numpy', numpy.__version__)"
+          python -c "import deleteme; print('deleteme', deleteme.__version__)"
+          python -m deleteme --version
+
+      - name: Check for conflicting dependencies
+        run: python -m pip check
+
+      - name: Verify the bundled models are the upstream ones
+        run: python -m deleteme.tools.fetch_models --verify-only
+
+      - name: Test
+        run: python -m pytest -q
+
+  gui-import:
+    # The application module needs Tk and Pillow's Tk bridge. The test suite
+    # deliberately does not import it — deleteme.cli exists so the command line
+    # can be checked without a display — but something should still confirm the
+    # window module is importable somewhere.
+    name: gui import
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - run: python -c "import deleteme.app; print('app module imports:', deleteme.app.DeleteMeApp.__name__)"

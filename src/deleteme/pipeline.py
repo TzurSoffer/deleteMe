@@ -74,6 +74,14 @@ class EffectPipeline:
         self._feather = self.config.segmentation.feather_kernel_px | 1
         self._closed = False
 
+        self.force: bool | None = None
+        """Manual override of the gesture gate.
+
+        Useful when filming without wanting a hand in shot, and when testing
+        without a person in front of the camera. ``None`` returns control to the
+        recogniser.
+        """
+
     def process(self, frame: Frame) -> PipelineResult:
         timings: dict[str, float] = {}
         now = frame.timestamp_s
@@ -87,7 +95,8 @@ class EffectPipeline:
         else:
             reading = GestureReading(GestureState.UNKNOWN)
 
-        engaged = self.gate.update(reading, now)
+        gated = self.gate.update(reading, now)
+        engaged = gated if self.force is None else self.force
         self.dissolve.target(engaged, now)
         strength = self.dissolve.value(now)
 
