@@ -21,7 +21,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import sys
-import threading
 import tkinter as tk
 from enum import Enum, auto
 from pathlib import Path
@@ -35,13 +34,14 @@ from PIL import Image, ImageTk
 from deleteme import __version__
 from deleteme.background import BackgroundModel, HealthState
 from deleteme.camera import CameraSession, PhotometryLock
+from deleteme.capture import PlateCaptureWorker
 from deleteme.config import AppConfig
-from deleteme.errors import CameraError, DeleteMeError
+from deleteme.errors import DeleteMeError
 from deleteme.frames import Frame, FrameSource, RecordingSink
 from deleteme.gesture import GestureReader, GestureWorker
 from deleteme.paths import plate_paths
 from deleteme.pipeline import EffectPipeline
-from deleteme.plate import Plate, PlateCapture, PlateStore
+from deleteme.plate import PlateCapture, PlateStore
 from deleteme.segment import PersonSegmenter
 from deleteme.timers import high_resolution_timer
 
@@ -60,130 +60,6 @@ class Mode(Enum):
     """No plate yet — show the camera and invite a capture."""
     CAPTURING = auto()
     RUNNING = auto()
-
-
-class _CaptureWorker(threading.Thread):
-    """Warms the camera, pins its photometry, and collects a plate.
-
-    On a thread because the exposure probe genuinely takes seconds: it changes
-    a camera setting and waits to see whether the picture responds, several
-    times over. Doing that on the UI thread would freeze the window during the
-    one operation the user is actively watching.
-    """
-
-    def __init__(
-        self,
-        source: FrameSource,
-        segmenter: PersonSegmenter,
-        config: AppConfig,
-        relock: bool,
-    ) -> None:
-        super().__init__(name="deleteme-capture-plate", daemon=True)
-        self._source = source
-        self._segmenter = segmenter
-        self._config = config
-        self._relock = relock
-
-        self._lock = threading.Lock()
-        self._cancel = threading.Event()
-        self._preview: np.ndarray | None = None
-        self._progress = 0.0
-        self._message = "starting the camera"
-        self.plate: Plate | None = None
-        self.error: BaseException | None = None
-        self.finished = threading.Event()
-
-    # ------------------------------------------------------------- published
-
-    @property
-    def preview(self) -> np.ndarray | None:
-        with self._lock:
-            return self._preview
-
-    @property
-    def progress(self) -> float:
-        with self._lock:
-            return self._progress
-
-    @property
-    def message(self) -> str:
-        with self._lock:
-            return self._message
-
-    def _publish(self, preview: np.ndarray | None, progress: float, message: str) -> None:
-        with self._lock:
-            if preview is not None:
-                self._preview = preview
-            self._progress = progress
-            self._message = message
-
-    def cancel(self) -> None:
-        self._cancel.set()
-
-    # ------------------------------------------------------------------- run
-
-    def run(self) -> None:
-        try:
-            self._run()
-        except BaseException as exc:
-            self.error = exc
-            log.exception("background capture failed")
-        finally:
-            self.finished.set()
-
-    def _run(self) -> None:
-        camera = self._source if isinstance(self._source, CameraSession) else None
-
-        if camera is not None:
-            self._publish(None, 0.0, "letting the camera settle")
-            # The cancel token goes all the way down. Both of these run for
-            # seconds — the exposure probe can take 96 camera reads against a
-            # driver that accepts every request without honouring it — and a
-            # shutdown that cannot get this thread out in time would end up
-            # releasing the capture while it is still inside cap.read().
-            camera.warm_up(cancel=self._cancel)
-            if self._cancel.is_set():
-                return
-            if self._relock:
-                self._publish(None, 0.0, "checking what this camera will let us pin down")
-                lock = camera.lock_photometry(cancel=self._cancel)
-                if self._cancel.is_set():
-                    return
-                if not lock.verified:
-                    log.info("exposure could not be pinned; software correction will carry it")
-
-        capture = PlateCapture(self._config.plate)
-        started = perf_counter()
-
-        while not self._cancel.is_set():
-            frame = self._source.read()
-            if frame is None:
-                if perf_counter() - started > self._config.plate.timeout_s:
-                    raise CameraError("the camera stopped delivering frames during capture")
-                continue
-
-            confidence = self._segmenter.confidence(frame.image)
-            scene_empty = bool(confidence.max() < self._config.segmentation.core_threshold)
-
-            quality = capture.offer(frame.image, scene_empty, perf_counter())
-            self._publish(
-                frame.image,
-                capture.progress(),
-                "hold still — capturing" if quality.ok else quality.reason,
-            )
-
-            if capture.complete:
-                lock = camera.lock if camera is not None else PhotometryLock()
-                backend = camera.backend_name if camera is not None else "replay"
-                index = camera.config.index if camera is not None else 0
-                self.plate = capture.build(backend, index, lock)
-                return
-
-            if capture.timed_out(perf_counter()):
-                raise DeleteMeError(
-                    f"Could not get a clean background in "
-                    f"{self._config.plate.timeout_s:.0f}s — {capture.last_reason}."
-                )
 
 
 class DeleteMeApp:
@@ -213,7 +89,7 @@ class DeleteMeApp:
         self.pipeline = EffectPipeline(self.background, self.segmenter, gesture_worker, self.config)
 
         self.mode = Mode.PREVIEW
-        self._worker: _CaptureWorker | None = None
+        self._worker: PlateCaptureWorker | None = None
         self._auto_capture: PlateCapture | None = None
         self._flash_until = 0.0
         self._flash_text = ""
@@ -319,15 +195,23 @@ class DeleteMeApp:
     # --------------------------------------------------------------- capture
 
     def start_capture(self) -> None:
+        """Begin capturing, or cancel a capture already under way.
+
+        Doubling as cancel matters: this is the one step that asks the user to
+        physically do something, so it is also the one they are most likely to
+        want to back out of.
+        """
         if self.mode is Mode.CAPTURING:
+            self.cancel_capture()
             return
         self.mode = Mode.CAPTURING
-        self.capture_button.state(["disabled"])
+        self.capture_button.configure(text="Cancel")
+        self.status.set("Starting the camera — get ready to step out of shot.")
         self.pipeline.reset()
         if isinstance(self.source, CameraSession):
             self.source.stop_stream()
 
-        self._worker = _CaptureWorker(
+        self._worker = PlateCaptureWorker(
             self.source,
             self.segmenter,
             self.config,
@@ -335,13 +219,19 @@ class DeleteMeApp:
         )
         self._worker.start()
 
-    def _finish_capture(self, worker: _CaptureWorker) -> None:
+    def cancel_capture(self) -> None:
+        worker = self._worker
+        if worker is not None:
+            worker.cancel()
+            self.status.set("Cancelling…")
+
+    def _finish_capture(self, worker: PlateCaptureWorker) -> None:
         self._worker = None
-        self.capture_button.state(["!disabled"])
+        self.capture_button.configure(text="Capture background")
 
         if worker.error is not None:
             messagebox.showerror("Could not capture the background", str(worker.error))
-            self.status.set("Background capture failed.")
+            self.status.set("Background capture failed. Press R or the button to try again.")
             self.mode = Mode.RUNNING if self.background.has_plate else Mode.PREVIEW
         elif worker.plate is not None:
             self.background.adopt(worker.plate, now=perf_counter())
@@ -352,7 +242,13 @@ class DeleteMeApp:
             self.mode = Mode.RUNNING
             self.status.set("Ready. Make a fist to disappear.")
         else:
+            # Cancelled. Neither a plate nor an error.
             self.mode = Mode.RUNNING if self.background.has_plate else Mode.PREVIEW
+            self.status.set(
+                "Capture cancelled."
+                if self.background.has_plate
+                else "Clear the scene, then capture the background."
+            )
 
         if isinstance(self.source, CameraSession):
             self.source.start_stream()

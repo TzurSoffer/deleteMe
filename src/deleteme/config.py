@@ -51,7 +51,14 @@ class CameraConfig:
 @dataclass(frozen=True)
 class PlateConfig:
     required_good_frames: int = 10
-    timeout_s: float = 20.0
+    timeout_s: float = 45.0
+    """Long enough to stand up and walk out of the camera's view.
+
+    Twenty seconds sounds generous at a desk and is not: the clock starts after
+    the camera has warmed up and its exposure has been pinned, by which point
+    the user has been watching a preview for a while and may not yet have
+    realised they are the thing blocking it.
+    """
 
     min_mean_luma: float = 60.0
     max_mean_luma: float = 200.0
