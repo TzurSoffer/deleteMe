@@ -158,10 +158,27 @@ that possible: `FrameSource`, which the camera, a recording and a synthetic nump
 sequence all satisfy, and `Clock`, which lets the debounce tests assert on time
 instead of on frame counts.
 
-Benchmark numbers should be read from the `min` column, and taken on an
-otherwise idle machine. The same unchanged code measured 7.5 ms and 40.8 ms an
-hour apart during development, purely because a browser and a container runtime
-woke up in between.
+### Performance
+
+Measured on a 20-core Raptor Lake laptop at 640×480, minimum of 80 runs:
+
+| stage | ms |
+|---|---|
+| segmentation (inference) | 4.4 |
+| change mask | 3.9 |
+| mask stabilisation | 3.5 |
+| background model | 2.5 |
+| composite | 1.1 |
+| photometric fit | 1.0 |
+| **total, effect engaged** | **15.4 of a 33.3 ms budget** |
+
+Gesture recognition adds nothing to that: it runs on its own thread.
+
+Read the `min` column, and measure on an otherwise idle machine. This is not
+pedantry — the same unchanged code measured 7.5 ms and 40.8 ms an hour apart
+during development, purely because a browser and a container runtime woke up in
+between. The tool prints a median/min ratio so you can see whether to believe
+it.
 
 ## Attribution
 
