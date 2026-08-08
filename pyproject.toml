@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deleteme"
+version = "0.2.0"
+description = "Make yourself disappear from your own webcam feed, with a background model that survives the lighting changing"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Tzur Soffer" }]
+keywords = ["webcam", "opencv", "mediapipe", "segmentation", "background-subtraction"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+
+# mediapipe declares no `requires_python` on PyPI, so pip performs no
+# interpreter gating whatsoever for it. The floor above and the import smoke
+# test in CI are the only things actually guarding the matrix.
+dependencies = [
+    "mediapipe>=1.0,<2",
+    "numpy>=2,<3",
+    "opencv-contrib-python>=4.10,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/TzurSoffer/deleteMe"
+Source = "https://github.com/TzurSoffer/deleteMe"
+Issues = "https://github.com/TzurSoffer/deleteMe/issues"
+
+# gui-scripts, not scripts: on Windows this produces a console-less launcher, so
+# starting the app does not also open a command window behind it.
+[project.gui-scripts]
+deleteme = "deleteme.app:main"
+
+[project.scripts]
+deleteme-cli = "deleteme.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+deleteme = ["models/*.tflite", "models/*.task"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF"]
+ignore = [
+    # Assigning a lambda or comprehension is not always clearer; and the
+    # numeric code below is more readable with explicit intermediate names.
+    "RUF005",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "camera: needs a real camera; skipped by default and in CI",
+    "models: needs the bundled model assets and runs real inference",
+]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+ignore_missing_imports = true
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["mediapipe.*"]
+ignore_missing_imports = true
