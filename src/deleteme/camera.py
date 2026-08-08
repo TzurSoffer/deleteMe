@@ -330,9 +330,15 @@ class CameraSession:
             "gain": cap.get(cv2.CAP_PROP_GAIN),
         }
 
-        verified = self._take_manual_exposure(cap, converged["exposure"])
-        if verified:
-            applied["auto_exposure"] = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+        manual_value = self._take_manual_exposure(cap, converged["exposure"])
+        verified = manual_value is not None
+        if manual_value is not None:
+            # Record the value that *worked*, not what the driver reports back.
+            # DSHOW returns -1 for AUTO_EXPOSURE regardless of what was set, so
+            # storing the read-back would write -1 into the plate metadata and
+            # replaying it next session would quietly fail to restore manual
+            # mode — losing exactly the property this metadata exists to carry.
+            applied["auto_exposure"] = manual_value
             applied["exposure"] = cap.get(cv2.CAP_PROP_EXPOSURE)
         else:
             failures.append("exposure")
@@ -361,14 +367,20 @@ class CameraSession:
         log.info("photometry lock: applied=%s failures=%s verified=%s", applied, failures, verified)
         return self.lock
 
-    def _take_manual_exposure(self, cap: cv2.VideoCapture, converged_exposure: float) -> bool:
-        """Try each manual sentinel until exposure demonstrably responds to us."""
+    def _take_manual_exposure(
+        self, cap: cv2.VideoCapture, converged_exposure: float
+    ) -> float | None:
+        """Try each manual sentinel until exposure demonstrably responds to us.
+
+        Returns the sentinel that worked, or ``None`` if none did.
+        """
         for candidate in _MANUAL_AUTO_EXPOSURE_CANDIDATES:
             if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, candidate):
                 continue
             if self._exposure_responds(cap, converged_exposure):
-                return True
-        return False
+                log.debug("exposure came under manual control at AUTO_EXPOSURE=%s", candidate)
+                return candidate
+        return None
 
     def _exposure_responds(self, cap: cv2.VideoCapture, baseline_exposure: float) -> bool:
         """Change the exposure and check whether the picture actually changed.
