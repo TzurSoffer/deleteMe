@@ -20,6 +20,7 @@ class DeleteMeApp:
             value="Clear the scene, then capture a background image from the live camera preview."
         )
         self.backgroundImage = None
+        self.drawBboxVar = tk.BooleanVar(value=True)
 
         container = ttk.Frame(self.root, padding=20)
         container.pack(fill="both", expand=True)
@@ -56,6 +57,13 @@ class DeleteMeApp:
         )
         self.startButton.pack(side="left", padx=(10, 0))
 
+        self.drawBboxCheckbox = ttk.Checkbutton(
+            container,
+            text="Draw person bounding box",
+            variable=self.drawBboxVar,
+        )
+        self.drawBboxCheckbox.pack(anchor="w", pady=(0, 12))
+
         status = ttk.Label(container, textvariable=self.statusVar, wraplength=470)
         status.pack(anchor="w")
 
@@ -64,6 +72,7 @@ class DeleteMeApp:
             f"Opening camera preview. Move away before the {captureCountdownSeconds}-second countdown ends."
         )
         self.root.update_idletasks()
+        previewWindowName = "Background Preview"
 
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
@@ -115,7 +124,7 @@ class DeleteMeApp:
                     cv2.LINE_AA,
                 )
 
-                cv2.imshow("Background Preview", previewFrame)
+                cv2.imshow(previewWindowName, previewFrame)
                 self.statusVar.set(
                     f"Preview running. Capture starts in {remaining} seconds."
                 )
@@ -123,6 +132,9 @@ class DeleteMeApp:
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
+                    self.statusVar.set("Background capture cancelled.")
+                    return
+                if cv2.getWindowProperty(previewWindowName, cv2.WND_PROP_VISIBLE) < 1:
                     self.statusVar.set("Background capture cancelled.")
                     return
 
@@ -137,7 +149,7 @@ class DeleteMeApp:
                 return
         finally:
             cap.release()
-            cv2.destroyWindow("Background Preview")
+            cv2.destroyWindow(previewWindowName)
 
         if frame is None:
             messagebox.showerror("Capture error", "Could not capture a background image.")
@@ -169,6 +181,7 @@ class DeleteMeApp:
     def runCameraLoop(self) -> None:
         detector = DeleteMe(bgImage=self.backgroundImage, fps=30)
         cap = cv2.VideoCapture(0)
+        appWindowName = "Delete Me"
 
         if not cap.isOpened():
             messagebox.showerror("Camera error", "Could not open the camera.")
@@ -180,10 +193,16 @@ class DeleteMeApp:
                 if not ret:
                     break
 
-                outputFrame = detector.deleteMe(frame)
-                cv2.imshow("Delete Me", outputFrame)
+                outputFrame = detector.deleteMe(
+                    frame,
+                    drawBbox=self.drawBboxVar.get(),
+                )
+                cv2.imshow(appWindowName, outputFrame)
 
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if cv2.getWindowProperty(appWindowName, cv2.WND_PROP_VISIBLE) < 1:
                     break
         finally:
             cap.release()

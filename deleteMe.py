@@ -13,19 +13,26 @@ class DeleteMe():
     def loadBackgroundImage(self, bgImage):
         self.bgImage = bgImage
 
-    def deleteMe(self, frame):
+    def deleteMe(self, frame, drawBbox=False):
         if self.bgImage is None:
             raise ValueError("Background image not set. Use loadBackgroundImage() to set it.")
+
         handClosed = self.handStateClassifier.isHandClosed(frame)
         if handClosed is None:
             # hand not found should be treated the same as hand open
             handClosed = False
         handClosed = self.state.update(handClosed)
+
         if handClosed == False:  #< hand open
             return frame
+
         bbox = self.personDetector.detectBbox(frame)
         if bbox is None:        #< person not found
             return frame
+        
+        if drawBbox == True:
+            frame = self.personDetector.drawBox(frame, bbox)
+
         x, y, w, h = bbox
         frame[y:y+h, x:x+w] = self.bgImage[y:y+h, x:x+w]
         return frame
